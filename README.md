@@ -22,6 +22,8 @@
 
 **VisLoc-MoGe-3DScanner** is a self-contained Android application uniting the **Visual-Inertial Localization & Forster On-Manifold IMU Pre-Integration** architecture of [**`rsasaki0109/visloc-rs`**](https://github.com/rsasaki0109/visloc-rs) with **on-device MoGe-3 / MoGe-2 LiteRT monocular metric 3D geometry**, **2D/3D KLT optical flow correspondence**, and **radiometric USB-C thermal camera fusion**.
 
+Crafted with **[Gemini 4 Argon](https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-argon/)**, **[Google Antigravity](https://antigravity.google/press)**, and built 3x faster using the official **[Android CLI](https://developer.android.com/blog/posts/android-cli-build-android-apps-3x-faster-using-any-agent)**.
+
 Specifically engineered and hardware-verified for smartphones both **with** a 6-axis MEMS IMU and **without** a physical gyroscope—including the **Xiaomi Redmi 13C 5G (`23124RN87I`, MediaTek Dimensity 6100+)**, where continuous $SO(3)$ angular velocity $\boldsymbol{\omega}_{\text{eff}}(t)$ and gravity-compensated linear acceleration are synthesized from the hardware **Bosch `bmi2xy_acc` 3-axis accelerometer (400 Hz)**, **MEMSIC `mmc5603` 3-axis magnetometer (50 Hz)**, **AOSP/MTK `TYPE_GEOMAGNETIC_ROTATION_VECTOR` (100 Hz)**, and **2D/3D KLT visual correspondence**.
 
 ---
@@ -119,6 +121,8 @@ $$\mathbf{x}_w = s^* \mathbf{R}_{wb_j} \mathbf{x}_c + \mathbf{p}_{wb_j}$$
 
 ## 🎬 Multi-Modal 3D Model Demonstration
 
+Continuous 360° synchronous turntable inspection showing the three generated 3D models side-by-side (10 FPS slow rotation):
+
 <p align="center">
   <img src="assets/moge3_rotating_triple_models.gif" alt="MoGe-3 Multi-Modal Metric 3D Models (Optical RGB vs. Fused vs. Radiometric Thermal)" width="100%" />
 </p>
@@ -127,6 +131,19 @@ $$\mathbf{x}_w = s^* \mathbf{R}_{wb_j} \mathbf{x}_c + \mathbf{p}_{wb_j}$$
 | :--- | :--- | :--- |
 | **Model:** `moge_scan_<ts>_rgb.glb` | **Model:** `moge_scan_<ts>_fused.glb` | **Model:** `moge_scan_<ts>_thermal.glb` |
 | True-color optical camera RGB texture on metric 3D mesh. | Calibrated Ironbow radiometric heatmap registered over RGB scene context. | Isolated thermal false-color radiometry mapped to metric surface geometry. |
+
+### Dual-Model Benchmark: MoGe-3 Metric vs. MoGe v2 Lightweight (2-Row Matrix)
+
+Synchronous 360° turntable evaluation (10 FPS slow rotation, 12.0s per loop) comparing dense metric reconstruction across models and multi-modal modalities:
+
+<p align="center">
+  <img src="assets/moge_dual_model_2row_rotation.gif" alt="Dual-Model 3D Scanner Benchmark: MoGe-3 vs. MoGe v2 (2-Row Synchronized Turntable)" width="100%" />
+</p>
+
+| Model Architecture | Density & Scale | Column 1: Optical RGB | Column 2: Fused Multi-Modal | Column 3: Radiometric Thermal |
+| :--- | :--- | :--- | :--- | :--- |
+| **Row 1: MoGe-3 Metric** | **112,896 pts** (ViT-L INT8, $0.28\text{--}3.5\text{m}$) | Sharp window mullions, true-scale depth metric coordinates | Sub-pixel registered thermal heatmap onto facade | Isolated thermal geometry with sharp thermal gradient |
+| **Row 2: MoGe v2 Lightweight** | **67,081 pts** (LiteRT FP16, low-RAM) | Smoothed architectural contours, direct Euclidean scaling | Homography overlay on approximate point cloud | Coarse thermal footprint, low memory profile (~200MB RAM) |
 
 ---
 
@@ -141,10 +158,14 @@ $$\mathbf{x}_w = s^* \mathbf{R}_{wb_j} \mathbf{x}_c + \mathbf{p}_{wb_j}$$
    - Merges multi-view MoGe-3 / MoGe-2 point clouds using full $SE(3)$ rotation + translation $(\mathbf{R}_{wb}, \mathbf{p}_{wb})$.
    - Automatically exports the 6-DoF camera trajectory (`visloc_trajectory_<timestamp>.tum`) in standard TUM RGB-D / EuRoC format (`timestamp tx ty tz qx qy qz qw`) to `/sdcard/Download/` alongside `.glb` and `.ply` 3D scans.
 3. **On-Device Monocular Metric 3D Geometry (MoGe-3 INT8 & MoGe-2 FP16)**:
-   - Hardware-accelerated LiteRT GPU / XNNPACK inference on Android.
+   - **MoGe-3 LiteRT INT8 (ViT-L)**: Monocular metric 3D point cloud estimation in true meters. Remaps factorized coordinates $(X/Z, Y/Z, \log Z)$ into metric space using $Z = \exp(\log Z) \cdot \exp(s)$, $X = (X/Z) \cdot Z$, $Y = (Y/Z) \cdot Z$.
+   - **MoGe v2 FP16**: Lightweight depth model with direct coordinate outputs and low memory footprint (~200 MB RAM).
 4. **USB-C Thermal Radiometry & 4-Corner Perspective Homography**:
-   - Connects to HT-203U / InfiRay UVC thermal cameras (`VID:0x2bdf PID:0x0102`), computes Celsius temperatures, and projects Ironbow thermal textures onto 3D geometry.
-5. **Google Filament 1.71.5 Native PBR 3D Viewer**:
+   - Connects to HT-203U / InfiRay / HIKMICRO UVC thermal cameras (`VID:0x2bdf PID:0x0102`), computes Celsius temperatures, and projects 8-anchor Ironbow thermal textures onto 3D geometry via interactive 4-corner $(A, B, C, D)$ homography calibration.
+5. **High-Speed Dataset Recording & Offline Batch 3D Reconstruction**:
+   - **`Dataset Rec` Mode**: Captures synchronized RGB frames, thermal images, raw 16-bit microbolometer buffers, and 3D orientation matrices at native sensor rates.
+   - **`⚡ Process Dataset` Engine**: Offline batch processor (`DatasetBatchProcessor.kt`) generating triple `.glb` models (`_fused.glb`, `_rgb.glb`, `_thermal.glb`).
+6. **Google Filament 1.71.5 Native PBR 3D Viewer**:
    - Zero-WebView, 120 FPS hardware-accelerated glTF/GLB turntable inspection directly inside the app.
 
 ---
@@ -154,7 +175,7 @@ $$\mathbf{x}_w = s^* \mathbf{R}_{wb_j} \mathbf{x}_c + \mathbf{p}_{wb_j}$$
 | File | Description |
 | :--- | :--- |
 | `app/src/main/java/com/example/moge3dscanner/ui/main/VislocImuEngine.kt` | **Core `visloc-rs` Port**: `VislocMath` ($SO(3)$ `so3Exp`, `so3Log`, `rightJacobian`), `ForsterImuPreintegrator`, `VislocKltTracker` (2D/3D patch optical flow), `VislocViBundleAdjuster` (static gravity init, VIBA2 closed-form scale & 6-DoF pose fusion, TUM trajectory export), and `VislocSensorEngine` (Redmi 13C 5G hybrid accelerometer + magnetometer + geomagnetic rotation vector + pseudo-gyro synthesis) |
-| `app/src/main/java/com/example/moge3dscanner/ui/main/MainScreen.kt` | Compose UI, live `visloc-rs` VI-SLAM HUD, CameraX analyzer, 6-DoF $SE(3)$ multi-frame point cloud transformer, OpenGL ES & Filament 3D viewers, GLB/PLY/TUM exporters |
+| `app/src/main/java/com/example/moge3dscanner/ui/main/MainScreen.kt` | Compose UI, live `visloc-rs` VI-SLAM HUD, `Gemini 4 Argon • Antigravity v2.0` badge, CameraX analyzer, 6-DoF $SE(3)$ multi-frame point cloud transformer, OpenGL ES & Filament 3D viewers, GLB/PLY/TUM exporters |
 | `app/src/main/java/com/example/moge3dscanner/ui/main/MogeInterpreter.kt` | LiteRT / TFLite engine supporting MoGe-3 ViT-L INT8 metric depth and MoGe-2 FP16 |
 | `app/src/main/java/com/example/moge3dscanner/ui/main/Filament3DViewer.kt` | Native Google Filament 1.71.5 PBR GLB viewer |
 | `app/src/main/java/com/example/moge3dscanner/ui/main/DatasetBatchProcessor.kt` | Offline dataset batch processor generating Fused, RGB, and Thermal 3D GLB models |
@@ -169,24 +190,44 @@ $$\mathbf{x}_w = s^* \mathbf{R}_{wb_j} \mathbf{x}_c + \mathbf{p}_{wb_j}$$
 ./download_models.sh
 
 # 2. Build the Debug APK
+#    (For the 133 MB Lightweight Redmi 13C 5G variant without MoGe-3 INT8, move
+#     moge3_dense_stage_weight_only_int8.tflite out of app/src/main/assets/ and run:
+#     ./gradlew clean assembleDebug --no-configuration-cache)
 ./gradlew assembleDebug
 
 # 3. Pair & Connect over Wi-Fi ADB to Redmi 13C 5G
 adb pair <PHONE_IP>:<PAIRING_PORT> <PAIRING_CODE>
 adb connect <PHONE_IP>:<CONNECT_PORT>
 
-# 4. Install & Launch VisLoc-MoGe-3DScanner
-adb -s <PHONE_IP>:<CONNECT_PORT> install -r -t -g app/build/outputs/apk/debug/app-debug.apk
+# 4. Two-Step Push & Install (recommended for >100 MB APKs over Wi-Fi ADB)
+adb -s <PHONE_IP>:<CONNECT_PORT> push app/build/outputs/apk/debug/app-debug.apk /data/local/tmp/visloc.apk
+adb -s <PHONE_IP>:<CONNECT_PORT> shell pm install -r -t -g /data/local/tmp/visloc.apk
+
+# 5. Grant Runtime Permissions & Launch
+adb -s <PHONE_IP>:<CONNECT_PORT> shell pm grant com.example.vislocmoge3dscanner android.permission.CAMERA
+adb -s <PHONE_IP>:<CONNECT_PORT> shell pm grant com.example.vislocmoge3dscanner android.permission.ACCESS_FINE_LOCATION
+adb -s <PHONE_IP>:<CONNECT_PORT> shell pm grant com.example.vislocmoge3dscanner android.permission.ACCESS_COARSE_LOCATION
 adb -s <PHONE_IP>:<CONNECT_PORT> shell am start -n com.example.vislocmoge3dscanner/com.example.moge3dscanner.MainActivity
 ```
 
 ---
 
-## 📚 References & Acknowledgments
+## 📚 Citations & References
 
+* **Google DeepMind & Gemini 4 Argon**:
+  * *Gemini 4 Argon Announcement*: [https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-argon/](https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-argon/)
+  * *Gemini 4 Argon Model Card*: [https://deepmind.google/models/model-cards/gemini-4-argon/](https://deepmind.google/models/model-cards/gemini-4-argon/)
+  * *Gemini 4 Argon for Robotics*: [https://developers.googleblog.com/gemini-4-argon-for-robotics/](https://developers.googleblog.com/gemini-4-argon-for-robotics/)
+  * *Google Antigravity Press Assets & Lockup*: [https://antigravity.google/press](https://antigravity.google/press)
+* **Android Developer Tools & CLI**:
+  * *Android CLI Article*: [https://developer.android.com/blog/posts/android-cli-build-android-apps-3x-faster-using-any-agent](https://developer.android.com/blog/posts/android-cli-build-android-apps-3x-faster-using-any-agent)
 * **`visloc-rs` — Visual Localization & Visual-Inertial SLAM in Rust**:
   * R. Sasaki, *visloc-rs: Feature matching, PnP localization, and monocular visual-inertial odometry in Rust*, [https://github.com/rsasaki0109/visloc-rs](https://github.com/rsasaki0109/visloc-rs)
 * **On-Manifold IMU Pre-Integration**:
   * C. Forster, L. Carlone, F. Dellaert, and D. Scaramuzza, *"On-Manifold Preintegration for Real-Time Visual-Inertial Odometry,"* IEEE Transactions on Robotics (T-RO), vol. 33, no. 1, pp. 1–21, 2017.
 * **MoGe — Monocular Geometry Estimation**:
   * R. Wang et al., *"MoGe: Unlocking Accurate Monocular Geometry Estimation for Open-Domain Images with Optimal Training Supervision,"* CVPR 2025, [https://github.com/microsoft/MoGe](https://github.com/microsoft/MoGe)
+* **HT203U Thermal Camera Integration & 3D Live Scanner Legacy**:
+  * *HT203U-Thermal*: [https://github.com/cfbird/HT203U-Thermal](https://github.com/cfbird/HT203U-Thermal)
+  * *Thermal Processing & Colormap*: [https://github.com/1kaiser/R_e/tree/main/thermal](https://github.com/1kaiser/R_e/tree/main/thermal)
+  * *3D Live Scanner*: [https://github.com/lvonasek/binary_live3dscanner](https://github.com/lvonasek/binary_live3dscanner)
