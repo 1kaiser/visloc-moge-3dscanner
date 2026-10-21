@@ -1,0 +1,512 @@
+package com.example.moge3dscanner.ui.main
+
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbManager
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import androidx.compose.runtime.State
+import androidx.compose.runtime.mutableStateOf
+import com.example.moge3dscanner.thermal.BulkUvc
+import com.example.moge3dscanner.thermal.UsbDesc
+import com.example.moge3dscanner.thermal.Xtherm
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Manages USB thermal camera connections (HT-203U, InfiRay, HIKMICRO UVC devices)
+ * using the native Android USB Host API and BulkUvc driver with Celsius processing,
+ * 8-anchor Ironbow colormapping, and 90-degree upright portrait orientation.
+ */
+class ThermalCameraManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "ThermalCameraManager"
+        private const val ACTION_USB_PERMISSION = "com.example.moge3dscanner.USB_PERMISSION"
+    }
+
+    private val usbManager by lazy { context.getSystemService(Context.USB_SERVICE) as UsbManager }
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val latestBitmap = AtomicReference<Bitmap?>(null)
+    private val latestRaw = AtomicReference<ShortArray?>(null)
+
+    private val _liveThermalBitmap = mutableStateOf<Bitmap?>(null)
+    val liveThermalBitmap: State<Bitmap?> = _liveThermalBitmap
+
+    private val _tempStatusState = mutableStateOf("")
+    val tempStatusState: State<String> = _tempStatusState
+
+    @Volatile private var isStreaming = false
+    @Volatile private var isConnected = false
+    @Volatile private var tempStatusText = ""
+    @Volatile private var minTempC = 0f
+    @Volatile private var maxTempC = 0f
+    @Volatile private var centerTempC = 0f
+
+    private var usbConn: UsbDeviceConnection? = null
+    private var bulk: BulkUvc? = null
+    private var usbDevice: UsbDevice? = null
+    private var modes: List<BulkUvc.FrameDesc> = emptyList()
+    private var modeIdx = 0
+    @Volatile private var curW = Xtherm.WIDTH
+    @Volatile private var curH = Xtherm.FRAME_HEIGHT
+    @Volatile private var radiometricSeen = false
+
+    private var bitmap: Bitmap = Bitmap.createBitmap(Xtherm.HEIGHT, Xtherm.WIDTH, Bitmap.Config.ARGB_8888)
+    private var rawPixels = IntArray(Xtherm.PIXELS)
+    private var rotatedPixels = IntArray(Xtherm.PIXELS)
+    private val palette = Xtherm.ironPalette()
+    private var frameU16 = ShortArray(256 * 520)
+    private var tempTable: FloatArray? = null
+    private var frameCount = 0L
+    @Volatile private var framesReceived = 0L
+
+    private var receiverRegistered = false
+
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (isStreaming && framesReceived == 0L && modes.isNotEmpty()) {
+                Log.w(TAG, "Watchdog: 0 frames received in mode $modeIdx, switching...")
+                tryNextMode("watchdog timeout")
+            }
+            if (isStreaming) {
+                mainHandler.postDelayed(this, 2500)
+            }
+        }
+    }
+
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, intent: Intent) {
+            when (intent.action) {
+                ACTION_USB_PERMISSION -> {
+                    val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    Log.i(TAG, "USB permission result: granted=$granted dev=${device?.productName}")
+                    if (granted && device != null) {
+                        openAndStart(device)
+                    } else {
+                        setStatus("USB permission denied")
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    Log.i(TAG, "USB device attached")
+                    scanAndConnect()
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    Log.i(TAG, "USB device detached")
+                    stopStreaming()
+                    setStatus("Device detached")
+                }
+            }
+        }
+    }
+
+    init {
+        registerReceiver()
+    }
+
+    private fun setStatus(msg: String) {
+        tempStatusText = msg
+        mainHandler.post { _tempStatusState.value = msg }
+    }
+
+    private fun registerReceiver() {
+        if (receiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(ACTION_USB_PERMISSION)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(usbReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(usbReceiver, filter)
+        }
+        receiverRegistered = true
+    }
+
+    private fun unregisterReceiver() {
+        if (!receiverRegistered) return
+        try {
+            context.unregisterReceiver(usbReceiver)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister USB receiver: ${e.message}")
+        }
+        receiverRegistered = false
+    }
+
+    private fun hasVideoInterface(device: UsbDevice): Boolean {
+        for (i in 0 until device.interfaceCount) {
+            val itf = device.getInterface(i)
+            if (itf.interfaceClass == 14) return true
+        }
+        return false
+    }
+
+    fun startStreaming(): Boolean {
+        if (isStreaming) return true
+        return scanAndConnect()
+    }
+
+    private fun scanAndConnect(): Boolean {
+        val device = usbManager.deviceList.values.firstOrNull { hasVideoInterface(it) }
+        if (device == null) {
+            setStatus("No USB thermal camera found")
+            Log.w(TAG, "No UVC video camera device found in USB device list")
+            return false
+        }
+
+        Log.i(TAG, "Found thermal device VID=0x%04x PID=0x%04x name=%s".format(
+            device.vendorId, device.productId, device.productName ?: "Unknown"
+        ))
+
+        if (usbManager.hasPermission(device)) {
+            openAndStart(device)
+            return true
+        } else {
+            setStatus("Requesting USB permission...")
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_MUTABLE else 0
+            val pi = PendingIntent.getBroadcast(
+                context, 0,
+                Intent(ACTION_USB_PERMISSION).setPackage(context.packageName),
+                flags
+            )
+            usbManager.requestPermission(device, pi)
+            return false
+        }
+    }
+
+    private fun openAndStart(device: UsbDevice) {
+        stopStreamingInternal()
+        val conn = usbManager.openDevice(device)
+        if (conn == null) {
+            setStatus("Failed to open USB device")
+            Log.e(TAG, "usbManager.openDevice returned null")
+            return
+        }
+
+        usbDevice = device
+        usbConn = conn
+        conn.rawDescriptors?.let { Log.d(TAG, UsbDesc.summarize(it)) }
+
+        val uvc = BulkUvc(
+            device, conn,
+            onFrame = ::onBulkFrame,
+            onReaderError = {
+                mainHandler.post { tryNextMode("reader persistent errors") }
+            },
+            log = { msg -> Log.d(TAG, msg) }
+        )
+        bulk = uvc
+        val all = uvc.parseDescriptors()
+        if (all.isEmpty()) {
+            setStatus("No uncompressed frame descriptors found")
+            Log.w(TAG, "No uncompressed frame descriptors in device")
+            return
+        }
+
+        // Strictly use formatIndex == 1 (YUY2 16-bit raw radiometric frames)
+        // Preference: 192 (standard raw IR), 196 (Xtherm), 400 (stacked), 250, 344, 410
+        val prio = mapOf(192 to 0, 196 to 1, 400 to 2, 392 to 3, 250 to 4, 344 to 5, 410 to 6)
+        val yuy2Modes = all.filter { it.formatIndex == 1 }
+        modes = (if (yuy2Modes.isNotEmpty()) yuy2Modes else all).sortedBy {
+            (if (it.width == 256) 0 else 10) + (prio[it.height] ?: 9)
+        }
+        Log.i(TAG, "Modes ordered: " + modes.joinToString { "fmt=${it.formatIndex} ${it.width}x${it.height}" })
+        modeIdx = 0
+        radiometricSeen = false
+        isStreaming = true
+        isConnected = true
+        startMode("initial")
+
+        mainHandler.removeCallbacks(watchdog)
+        mainHandler.postDelayed(watchdog, 2500)
+    }
+
+    private fun tryNextMode(reason: String) {
+        if (!isStreaming || modes.isEmpty()) return
+        modeIdx = (modeIdx + 1) % modes.size
+        startMode("fallback ($reason) -> modeIdx=$modeIdx")
+    }
+
+    private fun startMode(reason: String) {
+        val uvc = bulk ?: return
+        val fd = modes.getOrNull(modeIdx) ?: return
+        Log.i(TAG, "startMode ${fd.width}x${fd.height} ($reason)")
+        curW = fd.width
+        curH = fd.height
+        framesReceived = 0
+        frameCount = 0
+        tempTable = null
+        if (!uvc.start(fd)) {
+            Log.e(TAG, "Mode ${fd.width}x${fd.height} failed to start")
+            setStatus("Mode ${fd.width}x${fd.height} failed")
+        } else {
+            setStatus("Connecting ${fd.width}x${fd.height}...")
+        }
+    }
+
+    private fun onBulkFrame(frame: ByteBuffer) {
+        try {
+            processFrame(frame)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Frame processing error: ${t.message}", t)
+        }
+    }
+
+    private fun ensureBuffers(n: Int) {
+        if (rawPixels.size < n) rawPixels = IntArray(n)
+        if (rotatedPixels.size < n) rotatedPixels = IntArray(n)
+    }
+
+    private fun inRange(off: Int, lo: Int, hi: Int): Double {
+        var hit = 0
+        var total = 0
+        var i = off
+        val end = off + Xtherm.PIXELS
+        while (i < end) {
+            val v = frameU16[i].toInt() and 0xFFFF
+            if (v in (lo - 256)..(hi + 256)) hit++
+            total++
+            i += 97
+        }
+        return if (total == 0) 0.0 else hit.toDouble() / total
+    }
+
+    private fun processFrame(frame: ByteBuffer) {
+        framesReceived++
+        frameCount++
+
+        val nU16 = frame.remaining() / 2
+        if (nU16 < curW * 100) return
+        if (frameU16.size < nU16) frameU16 = ShortArray(nU16)
+        frame.order(ByteOrder.LITTLE_ENDIAN)
+        frame.asShortBuffer().get(frameU16, 0, nU16)
+
+        val w = curW
+        val h = if (nU16 % w == 0) nU16 / w else curH
+
+        // 1) Xtherm-style metadata (256-wide layouts)
+        if (w == 256) {
+            var k = 1
+            while (k * 196 <= h) {
+                val base = (k - 1) * 196
+                val meta = Xtherm.parseMeta(frameU16, w * (base + Xtherm.HEIGHT))
+                if (meta != null) {
+                    val cands = ArrayList<Int>(3)
+                    cands.add(w * base)
+                    if (w * (base + 196) + Xtherm.PIXELS <= nU16) cands.add(w * (base + 196))
+                    if (base >= 196) cands.add(w * (base - 196))
+                    val best = cands.maxByOrNull { inRange(it, meta.minRaw, meta.maxRaw) } ?: (w * base)
+                    renderXtherm(meta, best)
+                    return
+                }
+                k++
+            }
+        }
+
+        // 2) Stacked frame: bottom half raw Kelvin*64
+        if (h >= 2 * 190) {
+            val rows = h / 2
+            val bottom = w * rows
+            val count = w * minOf(rows, h - rows)
+            var mn = 65535; var mx = 0
+            for (i in bottom until bottom + count) {
+                val v = frameU16[i].toInt() and 0xFFFF
+                if (v < mn) mn = v
+                if (v > mx) mx = v
+            }
+            if (mn in 14000..50000 && mx in 14000..50000 && mx > mn + 16) {
+                renderK64(bottom, mn, mx, w, minOf(rows, h - rows))
+                return
+            }
+        }
+
+        // 3) Standard active thermal frame (first 256x192 pixels)
+        // Directly decodes active microbolometer matrix for 256x192, 256x196, 256x344, 256x400
+        if (nU16 >= Xtherm.PIXELS) {
+            renderHikRaw(0)
+            return
+        }
+
+        // Fallback: simple luma display
+        val rows = minOf(h, 192)
+        ensureBuffers(w * rows)
+        for (i in 0 until w * rows) {
+            val y = frameU16[i].toInt() and 0xFF
+            rawPixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
+        }
+        updateOutputBitmap(w, rows, frameU16.copyOf(w * rows))
+    }
+
+    private fun drawMarker(x: Int, y: Int, w: Int, h: Int, color: Int) {
+        for (d in -4..4) {
+            val px = (x + d).coerceIn(0, w - 1)
+            val py = (y + d).coerceIn(0, h - 1)
+            rawPixels[y.coerceIn(0, h - 1) * w + px] = color
+            rawPixels[py * w + x.coerceIn(0, w - 1)] = color
+        }
+    }
+
+    private fun renderXtherm(meta: Xtherm.Meta, imageOff: Int) {
+        if (tempTable == null || frameCount % 8 == 0L) {
+            tempTable = Xtherm.tempTable(meta, false)
+        }
+        val table = tempTable ?: return
+        val minRaw = meta.minRaw
+        val span = (meta.maxRaw - minRaw).coerceAtLeast(1)
+        ensureBuffers(Xtherm.PIXELS)
+        for (i in 0 until Xtherm.PIXELS) {
+            val v = frameU16[imageOff + i].toInt() and 0xFFFF
+            val idx = ((v - minRaw) * 255 / span).coerceIn(0, 255)
+            rawPixels[i] = palette[idx]
+        }
+        drawMarker(meta.minX, meta.minY, Xtherm.WIDTH, Xtherm.HEIGHT, 0xFF40A0FF.toInt())
+        drawMarker(meta.maxX, meta.maxY, Xtherm.WIDTH, Xtherm.HEIGHT, 0xFFFF4040.toInt())
+        drawMarker(Xtherm.WIDTH / 2, Xtherm.HEIGHT / 2, Xtherm.WIDTH, Xtherm.HEIGHT, 0xFFFFFFFF.toInt())
+        minTempC = table[meta.minRaw]
+        centerTempC = table[meta.centerRaw]
+        maxTempC = table[meta.maxRaw]
+        setStatus("%.1f°C (%.1f..%.1f)".format(centerTempC, minTempC, maxTempC))
+        updateOutputBitmap(Xtherm.WIDTH, Xtherm.HEIGHT, frameU16.copyOfRange(imageOff, imageOff + Xtherm.PIXELS))
+    }
+
+    private fun renderHikRaw(offset: Int) {
+        val w = Xtherm.WIDTH
+        val rows = Xtherm.HEIGHT
+        var mn = 65535; var mx = 0; var minI = 0; var maxI = 0
+        val count = w * rows
+        if (offset + count > frameU16.size) return
+        ensureBuffers(count)
+        for (i in 0 until count) {
+            val v = frameU16[offset + i].toInt() and 0xFFFF
+            if (v < mn) { mn = v; minI = i }
+            if (v > mx) { mx = v; maxI = i }
+        }
+        val span = (mx - mn).coerceAtLeast(1)
+        for (i in 0 until count) {
+            val v = frameU16[offset + i].toInt() and 0xFFFF
+            val idx = ((v - mn) * 255 / span).coerceIn(0, 255)
+            rawPixels[i] = palette[idx]
+        }
+        val center = frameU16[offset + (rows / 2) * w + w / 2].toInt() and 0xFFFF
+        drawMarker(minI % w, minI / w, w, rows, 0xFF40A0FF.toInt())
+        drawMarker(maxI % w, maxI / w, w, rows, 0xFFFF4040.toInt())
+        drawMarker(w / 2, rows / 2, w, rows, 0xFFFFFFFF.toInt())
+        minTempC = Xtherm.rawToCelsius(mn)
+        centerTempC = Xtherm.rawToCelsius(center)
+        maxTempC = Xtherm.rawToCelsius(mx)
+        setStatus("%.1f°C (%.1f..%.1f)".format(centerTempC, minTempC, maxTempC))
+        updateOutputBitmap(w, rows, frameU16.copyOfRange(offset, offset + count))
+    }
+
+    private fun renderK64(offset: Int, mn: Int, mx: Int, w: Int, rows: Int) {
+        val span = (mx - mn).coerceAtLeast(1)
+        val n = w * rows
+        var minI = 0; var maxI = 0
+        ensureBuffers(n)
+        for (i in 0 until n) {
+            val v = frameU16[offset + i].toInt() and 0xFFFF
+            if (v == mn) minI = i
+            if (v == mx) maxI = i
+            val idx = ((v - mn) * 255 / span).coerceIn(0, 255)
+            rawPixels[i] = palette[idx]
+        }
+        val center = frameU16[offset + (rows / 2) * w + w / 2].toInt() and 0xFFFF
+        drawMarker(minI % w, minI / w, w, rows, 0xFF40A0FF.toInt())
+        drawMarker(maxI % w, maxI / w, w, rows, 0xFFFF4040.toInt())
+        drawMarker(w / 2, rows / 2, w, rows, 0xFFFFFFFF.toInt())
+        fun k64(v: Int) = (v / 64.0 - 273.15).toFloat()
+        minTempC = k64(mn)
+        centerTempC = k64(center)
+        maxTempC = k64(mx)
+        setStatus("%.1f°C (%.1f..%.1f)".format(centerTempC, minTempC, maxTempC))
+        updateOutputBitmap(w, rows, frameU16.copyOfRange(offset, offset + n))
+    }
+
+    /**
+     * Rotate raw 256x192 landscape pixels 90 degrees clockwise into 192x256 upright portrait
+     * to match phone screen aspect ratio and R_e/thermal orientation.
+     */
+    private fun updateOutputBitmap(srcW: Int, srcH: Int, rawData: ShortArray?) {
+        val dstW = srcH  // 192
+        val dstH = srcW  // 256
+        ensureBuffers(dstW * dstH)
+
+        for (y in 0 until srcH) {
+            for (x in 0 until srcW) {
+                val srcIdx = y * srcW + x
+                val dstX = srcH - 1 - y  // 90° CW
+                val dstY = x
+                rotatedPixels[dstY * dstW + dstX] = rawPixels[srcIdx]
+            }
+        }
+
+        if (bitmap.width != dstW || bitmap.height != dstH) {
+            bitmap = Bitmap.createBitmap(dstW, dstH, Bitmap.Config.ARGB_8888)
+        }
+        bitmap.setPixels(rotatedPixels, 0, dstW, 0, 0, dstW, dstH)
+        val copy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        latestBitmap.set(copy)
+        if (rawData != null) {
+            latestRaw.set(rawData)
+        }
+        mainHandler.post {
+            _liveThermalBitmap.value = copy
+        }
+    }
+
+    private fun stopStreamingInternal() {
+        mainHandler.removeCallbacks(watchdog)
+        isStreaming = false
+        bulk?.close()
+        bulk = null
+        usbConn?.close()
+        usbConn = null
+        usbDevice = null
+    }
+
+    fun stopStreaming() {
+        stopStreamingInternal()
+        latestBitmap.set(null)
+        latestRaw.set(null)
+        mainHandler.post { _liveThermalBitmap.value = null }
+    }
+
+    fun captureFrame(): Bitmap? = latestBitmap.get()
+
+    fun captureRaw(): ShortArray? = latestRaw.get()
+
+    fun isStreaming(): Boolean = isStreaming
+
+    fun isSdkAvailable(): Boolean = true
+
+    fun isDeviceConnected(): Boolean = isConnected
+
+    fun getTemperatureInfo(): String = tempStatusText
+
+    fun getMinTempC(): Float = minTempC
+    fun getMaxTempC(): Float = maxTempC
+    fun getCenterTempC(): Float = centerTempC
+
+    fun close() {
+        stopStreaming()
+        unregisterReceiver()
+    }
+}
