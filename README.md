@@ -3,8 +3,8 @@
 <table align="center" width="100%">
   <tr>
     <td width="33.33%" align="center" valign="middle">
-      <a href="https://blog.google/technology/google-deepmind/gemini-model-updates-february-2025/">
-        <img src="assets/gemini_3_7_flash.png" alt="Gemini 3.7 Flash" width="100%" />
+      <a href="https://blog.google/technology/google-deepmind/">
+        <img src="assets/gemini_4_argon.png" alt="Gemini 4 Argon" width="100%" />
       </a>
     </td>
     <td width="33.33%" align="center" valign="middle">

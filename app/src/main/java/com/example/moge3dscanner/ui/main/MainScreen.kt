@@ -610,7 +610,7 @@ fun MainScreen(
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            // Gemini 3.7 & Google Antigravity Version Branding Badge
+            // Gemini 4 Argon & Google Antigravity Version Branding Badge
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -621,7 +621,7 @@ fun MainScreen(
             ) {
                 GeminiSparkleLogo(modifier = Modifier.size(11.dp))
                 Text(
-                    text = "Gemini 3.7",
+                    text = "Gemini 4 Argon",
                     fontFamily = FontFamily.Monospace,
                     fontSize = 8.sp,
                     fontWeight = FontWeight.Bold,
