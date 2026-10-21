@@ -3,7 +3,7 @@
 <table align="center" width="100%">
   <tr>
     <td width="33.33%" align="center" valign="middle">
-      <a href="https://blog.google/technology/google-deepmind/">
+      <a href="https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-argon/">
         <img src="assets/gemini_4_argon.png" alt="Gemini 4 Argon" width="100%" />
       </a>
     </td>
