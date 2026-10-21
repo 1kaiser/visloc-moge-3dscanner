@@ -31,7 +31,8 @@ Specifically engineered and hardware-verified for smartphones both **with** a 6-
 Direct download links for official release binaries on [**GitHub Releases (`1kaiser/visloc-moge-3dscanner/releases`)**](https://github.com/1kaiser/visloc-moge-3dscanner/releases):
 
 * **[VisLoc-MoGe-3DScanner v1.0.0 (Latest Release)](https://github.com/1kaiser/visloc-moge-3dscanner/releases/tag/v1.0.0)**
-  * **Full Metric APK**: [**`visloc-moge-3dscanner-v1.0.0.apk`**](https://github.com/1kaiser/visloc-moge-3dscanner/releases/download/v1.0.0/visloc-moge-3dscanner-v1.0.0.apk) — Self-contained offline build bundling both **MoGe-3 INT8** and **MoGe-2 FP16** LiteRT models, **`VislocImuEngine`** (Forster on-manifold IMU pre-integrator + KLT tracker + VIBA2 scale/pose solver), **Google Filament 1.71.5** native PBR 3D viewer, and **HT-203U / InfiRay** USB-C thermal fusion.
+  * **Full Metric APK (MoGe-3 INT8 + MoGe-2 FP16)**: [**`visloc-moge-3dscanner-v1.0.0.apk`**](https://github.com/1kaiser/visloc-moge-3dscanner/releases/download/v1.0.0/visloc-moge-3dscanner-v1.0.0.apk) (**456 MB**) — Self-contained offline build bundling both **MoGe-3 INT8** and **MoGe-2 FP16** LiteRT models, **`VislocImuEngine`** (Forster on-manifold IMU pre-integrator + KLT tracker + VIBA2 scale/pose solver), **Google Filament 1.71.5** native PBR 3D viewer, and **HT-203U / InfiRay** USB-C thermal fusion.
+  * **Redmi 13C 5G Lightweight Fast-Install APK (MoGe-2 FP16)**: [**`visloc-moge-3dscanner-v1.0.0-moge2-lightweight.apk`**](https://github.com/1kaiser/visloc-moge-3dscanner/releases/download/v1.0.0/visloc-moge-3dscanner-v1.0.0-moge2-lightweight.apk) (**133 MB**) — Fast wireless-ADB install & low-RAM (~200 MB) build bundling **MoGe-2 FP16** and the full **`visloc-rs` Redmi 13C 5G Hybrid IMU + KLT + VIBA2 6-DoF Engine**.
 
 ---
 
