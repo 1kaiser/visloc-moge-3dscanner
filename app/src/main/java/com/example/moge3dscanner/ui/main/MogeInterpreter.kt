@@ -5,19 +5,36 @@ import android.graphics.Bitmap
 import android.util.Log
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
+import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import java.util.Locale
 import kotlin.math.exp
 
 /**
  * High-performance LiteRT / TFLite interpreter for MoGe-3 (and backwards-compatible with MoGe v2).
  * Automatically detects whether the active model is MoGe-3 (CHW 672x672 factorized) or MoGe v2 (HWC 518x518).
+ * Supports bundled assets, persistent app-local cache, and automatic first-run download from Hugging Face.
  */
-class MogeInterpreter(private val context: Context) {
+class MogeInterpreter(
+    private val context: Context,
+    private val onStatusUpdate: ((String) -> Unit)? = null
+) {
+
+    companion object {
+        private const val TAG = "MogeInterpreter"
+        private const val DEFAULT_MODEL_FILENAME = "moge3_dense_stage_weight_only_int8.tflite"
+        private const val HF_MODEL_URL =
+            "https://huggingface.co/1kaiser/moge3-litert/resolve/main/moge3_dense_stage_weight_only_int8.tflite"
+        private const val MIN_VALID_MODEL_BYTES = 10L * 1024L * 1024L // 10 MB sanity floor
+    }
 
     private var interpreter: Interpreter? = null
     private var gpuDelegate: GpuDelegate? = null
@@ -25,7 +42,13 @@ class MogeInterpreter(private val context: Context) {
     var isMoge3: Boolean = false
         private set
 
-    var activeModelName: String = "moge3_dense_stage_weight_only_int8.tflite"
+    var isReady: Boolean = false
+        private set
+
+    var loadError: String? = null
+        private set
+
+    var activeModelName: String = DEFAULT_MODEL_FILENAME
         private set
 
     var activeAccelerator = "CPU (XNNPACK)"
@@ -75,7 +98,6 @@ class MogeInterpreter(private val context: Context) {
     }
 
     private fun initModel() {
-        // Preferred order: MoGe-3 INT8 -> MoGe v2 FP16
         val candidates = listOf(
             "moge3_dense_stage_weight_only_int8.tflite",
             "moge3_dense_stage_fp16.tflite",
@@ -85,26 +107,61 @@ class MogeInterpreter(private val context: Context) {
         var loadedModel: String? = null
         var modelBuffer: MappedByteBuffer? = null
 
+        // 1. Check bundled APK assets first
         val assetList = try { context.assets.list("")?.toSet() ?: emptySet() } catch (_: Exception) { emptySet() }
-
         for (candidate in candidates) {
             if (assetList.contains(candidate)) {
                 try {
-                    modelBuffer = loadModelFile(context, candidate)
+                    onStatusUpdate?.invoke("Loading bundled $candidate...")
+                    modelBuffer = loadAssetModelFile(context, candidate)
                     loadedModel = candidate
                     break
                 } catch (e: Exception) {
-                    Log.w("MogeInterpreter", "Failed to load candidate $candidate: ${e.message}")
+                    Log.w(TAG, "Failed to load asset candidate $candidate: ${e.message}")
                 }
             }
         }
 
+        // 2. Check cached local model files in app storage
+        val modelsDir = File(context.noBackupFilesDir, "models").apply { mkdirs() }
         if (modelBuffer == null) {
-            Log.e("MogeInterpreter", "No suitable MoGe model found in assets!")
+            for (candidate in candidates) {
+                val localFile = File(modelsDir, candidate)
+                if (localFile.exists() && localFile.length() >= MIN_VALID_MODEL_BYTES) {
+                    try {
+                        onStatusUpdate?.invoke("Loading cached 3D AI model...")
+                        modelBuffer = mapFileReadOnly(localFile)
+                        loadedModel = candidate
+                        break
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to map cached model ${localFile.absolutePath}: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        // 3. Download MoGe-3 INT8 from Hugging Face if not yet present locally
+        if (modelBuffer == null) {
+            val targetFile = File(modelsDir, DEFAULT_MODEL_FILENAME)
+            try {
+                downloadModelFromHuggingFace(HF_MODEL_URL, targetFile)
+                onStatusUpdate?.invoke("Initializing 3D AI engine...")
+                modelBuffer = mapFileReadOnly(targetFile)
+                loadedModel = DEFAULT_MODEL_FILENAME
+            } catch (e: Exception) {
+                loadError = e.message ?: "Download failed"
+                Log.e(TAG, "Failed to download MoGe model from Hugging Face", e)
+                return
+            }
+        }
+
+        if (modelBuffer == null) {
+            loadError = "No suitable MoGe model available"
+            Log.e(TAG, "No suitable MoGe model found!")
             return
         }
 
-        activeModelName = loadedModel ?: "unknown"
+        activeModelName = loadedModel ?: DEFAULT_MODEL_FILENAME
 
         // Attempt GPU acceleration first, fall back to CPU (XNNPACK)
         try {
@@ -114,18 +171,26 @@ class MogeInterpreter(private val context: Context) {
             }
             interpreter = Interpreter(modelBuffer, gpuOptions)
             activeAccelerator = "GPU"
-            Log.i("MogeInterpreter", "Successfully initialized TFLite ($activeModelName) with GPU Delegate.")
-        } catch (gpuException: Exception) {
-            Log.w("MogeInterpreter", "GPU Delegate unavailable. Falling back to CPU.", gpuException)
-            gpuDelegate?.close()
+            Log.i(TAG, "Successfully initialized TFLite ($activeModelName) with GPU Delegate.")
+        } catch (gpuException: Throwable) {
+            Log.w(TAG, "GPU Delegate unavailable. Falling back to CPU.", gpuException)
+            try {
+                gpuDelegate?.close()
+            } catch (_: Throwable) {}
             gpuDelegate = null
 
-            val cpuOptions = Interpreter.Options().apply {
-                setNumThreads(4)
+            try {
+                val cpuOptions = Interpreter.Options().apply {
+                    setNumThreads(4)
+                }
+                interpreter = Interpreter(modelBuffer, cpuOptions)
+                activeAccelerator = "CPU (XNNPACK)"
+                Log.i(TAG, "Successfully initialized TFLite ($activeModelName) with CPU.")
+            } catch (cpuException: Throwable) {
+                loadError = cpuException.message ?: "TFLite initialization failed"
+                Log.e(TAG, "CPU TFLite initialization failed", cpuException)
+                return
             }
-            interpreter = Interpreter(modelBuffer, cpuOptions)
-            activeAccelerator = "CPU (XNNPACK)"
-            Log.i("MogeInterpreter", "Successfully initialized TFLite ($activeModelName) with CPU.")
         }
 
         // Determine architecture from input tensor layout:
@@ -134,17 +199,130 @@ class MogeInterpreter(private val context: Context) {
             val inShape = interp.getInputTensor(0).shape()
             // MoGe-3 has shape [1, 3, 518, 518] (CHW), whereas MoGe v2 has [1, 518, 518, 3] (HWC)
             isMoge3 = (inShape.size == 4 && inShape[1] == 3)
-            Log.i("MogeInterpreter", "Architecture detected: isMoge3=$isMoge3 (Input Shape: ${inShape.joinToString()})")
+            isReady = true
+            loadError = null
+            Log.i(TAG, "Architecture detected: isMoge3=$isMoge3 (Input Shape: ${inShape.joinToString()})")
         }
     }
 
-    private fun loadModelFile(context: Context, modelName: String): MappedByteBuffer {
-        val fileDescriptor = context.assets.openFd(modelName)
-        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-        val fileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    private fun downloadModelFromHuggingFace(sourceUrl: String, targetFile: File) {
+        val partFile = File(targetFile.parentFile, "${targetFile.name}.part")
+        if (partFile.exists()) {
+            partFile.delete()
+        }
+
+        onStatusUpdate?.invoke("Connecting to Hugging Face for MoGe-3 model...")
+        var currentUrl = URL(sourceUrl)
+        var connection: HttpURLConnection? = null
+        var redirects = 0
+
+        while (redirects < 6) {
+            val conn = (currentUrl.openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = 20_000
+                readTimeout = 60_000
+                setRequestProperty("User-Agent", "VisLocMoGe3DScanner/3.0 Android")
+            }
+            val code = conn.responseCode
+            if (code in listOf(301, 302, 303, 307, 308)) {
+                val location = conn.getHeaderField("Location")
+                    ?: throw IllegalStateException("Redirect $code missing Location header")
+                conn.disconnect()
+                currentUrl = URL(currentUrl, location)
+                redirects++
+            } else {
+                connection = conn
+                break
+            }
+        }
+
+        val activeConn = connection ?: throw IllegalStateException("Too many redirects downloading model")
+        try {
+            val responseCode = activeConn.responseCode
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                throw IllegalStateException("HTTP $responseCode while downloading model")
+            }
+
+            val totalBytes = activeConn.contentLengthLong
+            var downloadedBytes = 0L
+            var lastReportTime = System.currentTimeMillis()
+            var lastReportedBytes = 0L
+
+            activeConn.inputStream.buffered(64 * 1024).use { input ->
+                FileOutputStream(partFile).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        downloadedBytes += read
+
+                        val now = System.currentTimeMillis()
+                        val elapsedSec = (now - lastReportTime) / 1000.0
+                        if (elapsedSec >= 0.35 || (totalBytes > 0 && downloadedBytes == totalBytes)) {
+                            val mbLoaded = downloadedBytes / (1024.0 * 1024.0)
+                            val speedMb = if (elapsedSec > 0) {
+                                ((downloadedBytes - lastReportedBytes) / (1024.0 * 1024.0)) / elapsedSec
+                            } else 0.0
+                            val msg = if (totalBytes > 0) {
+                                val pct = (downloadedBytes * 100.0 / totalBytes).coerceIn(0.0, 100.0)
+                                val mbTotal = totalBytes / (1024.0 * 1024.0)
+                                String.format(
+                                    Locale.US,
+                                    "Downloading MoGe-3: %.0f%% (%.0f/%.0f MB • %.1f MB/s)",
+                                    pct, mbLoaded, mbTotal, speedMb
+                                )
+                            } else {
+                                String.format(
+                                    Locale.US,
+                                    "Downloading MoGe-3: %.1f MB (%.1f MB/s)",
+                                    mbLoaded, speedMb
+                                )
+                            }
+                            onStatusUpdate?.invoke(msg)
+                            lastReportTime = now
+                            lastReportedBytes = downloadedBytes
+                        }
+                    }
+                    output.flush()
+                }
+            }
+
+            if (partFile.length() < MIN_VALID_MODEL_BYTES) {
+                partFile.delete()
+                throw IllegalStateException("Downloaded model file incomplete (${partFile.length()} bytes)")
+            }
+
+            if (targetFile.exists()) {
+                targetFile.delete()
+            }
+            if (!partFile.renameTo(targetFile)) {
+                partFile.copyTo(targetFile, overwrite = true)
+                partFile.delete()
+            }
+            Log.i(TAG, "Downloaded MoGe-3 model to ${targetFile.absolutePath} (${targetFile.length()} bytes)")
+        } finally {
+            activeConn.disconnect()
+        }
+    }
+
+    private fun loadAssetModelFile(context: Context, modelName: String): MappedByteBuffer {
+        context.assets.openFd(modelName).use { fileDescriptor ->
+            FileInputStream(fileDescriptor.fileDescriptor).use { inputStream ->
+                val fileChannel = inputStream.channel
+                return fileChannel.map(
+                    FileChannel.MapMode.READ_ONLY,
+                    fileDescriptor.startOffset,
+                    fileDescriptor.declaredLength
+                )
+            }
+        }
+    }
+
+    private fun mapFileReadOnly(file: File): MappedByteBuffer {
+        FileInputStream(file).use { inputStream ->
+            return inputStream.channel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
+        }
     }
 
     @Synchronized
@@ -313,7 +491,11 @@ class MogeInterpreter(private val context: Context) {
     }
 
     fun close() {
-        interpreter?.close()
-        gpuDelegate?.close()
+        try {
+            interpreter?.close()
+        } catch (_: Throwable) {}
+        try {
+            gpuDelegate?.close()
+        } catch (_: Throwable) {}
     }
 }

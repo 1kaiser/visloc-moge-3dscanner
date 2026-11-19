@@ -11,7 +11,12 @@ import android.provider.MediaStore
 import android.util.Log
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.Manifest
+import android.content.pm.PackageManager
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -487,12 +492,55 @@ fun MainScreen(
     }
     val rotationMatrix = vislocEngine.currentRotationMatrix
 
-    // GPS / Location setup
+    // Runtime Permissions (Camera & Location)
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    var hasLocationPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        hasCameraPermission = result[Manifest.permission.CAMERA] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        hasLocationPermission = result[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            result[Manifest.permission.ACCESS_COARSE_LOCATION] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    }
+    LaunchedEffect(Unit) {
+        if (!hasCameraPermission || !hasLocationPermission) {
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    // Back button handling for fullscreen / viewer overlays
+    BackHandler(enabled = isViewingModel || isCalibrationMode || fullscreenMode != FullscreenMode.NONE) {
+        when {
+            isViewingModel -> isViewingModel = false
+            isCalibrationMode -> isCalibrationMode = false
+            fullscreenMode != FullscreenMode.NONE -> fullscreenMode = FullscreenMode.NONE
+        }
+    }
+
+    // GPS / Location setup (reacts immediately once location permission is granted)
     val locationManager = remember { context.getSystemService(Context.LOCATION_SERVICE) as LocationManager }
     var currentLatitude by remember { mutableStateOf<Double?>(null) }
     var currentLongitude by remember { mutableStateOf<Double?>(null) }
 
-    DisposableEffect(locationManager) {
+    DisposableEffect(locationManager, hasLocationPermission) {
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
                 currentLatitude = location.latitude
@@ -502,46 +550,48 @@ fun MainScreen(
             override fun onProviderEnabled(provider: String) {}
             override fun onProviderDisabled(provider: String) {}
         }
-        
-        try {
-            val isGpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
-            val isNetworkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-            
-            if (isNetworkEnabled) {
-                locationManager.requestLocationUpdates(
-                    LocationManager.NETWORK_PROVIDER,
-                    5000L,
-                    1f,
-                    listener
-                )
-            } else if (isGpsEnabled) {
-                locationManager.requestLocationUpdates(
-                    LocationManager.GPS_PROVIDER,
-                    5000L,
-                    1f,
-                    listener
-                )
-            }
-            
-            val lastKnownGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-            val lastKnownNetwork = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-            val bestLocation = when {
-                lastKnownGps != null && lastKnownNetwork != null -> {
-                    if (lastKnownGps.time > lastKnownNetwork.time) lastKnownGps else lastKnownNetwork
+
+        if (hasLocationPermission) {
+            try {
+                val isGpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                val isNetworkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+
+                if (isNetworkEnabled) {
+                    locationManager.requestLocationUpdates(
+                        LocationManager.NETWORK_PROVIDER,
+                        5000L,
+                        1f,
+                        listener
+                    )
+                } else if (isGpsEnabled) {
+                    locationManager.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER,
+                        5000L,
+                        1f,
+                        listener
+                    )
                 }
-                lastKnownGps != null -> lastKnownGps
-                else -> lastKnownNetwork
+
+                val lastKnownGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                val lastKnownNetwork = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                val bestLocation = when {
+                    lastKnownGps != null && lastKnownNetwork != null -> {
+                        if (lastKnownGps.time > lastKnownNetwork.time) lastKnownGps else lastKnownNetwork
+                    }
+                    lastKnownGps != null -> lastKnownGps
+                    else -> lastKnownNetwork
+                }
+                if (bestLocation != null) {
+                    currentLatitude = bestLocation.latitude
+                    currentLongitude = bestLocation.longitude
+                }
+            } catch (e: SecurityException) {
+                Log.e("MainScreen", "Location permission missing or denied", e)
+            } catch (e: Exception) {
+                Log.e("MainScreen", "Failed to start location updates", e)
             }
-            if (bestLocation != null) {
-                currentLatitude = bestLocation.latitude
-                currentLongitude = bestLocation.longitude
-            }
-        } catch (e: SecurityException) {
-            Log.e("MainScreen", "Location permission missing or denied", e)
-        } catch (e: Exception) {
-            Log.e("MainScreen", "Failed to start location updates", e)
         }
-        
+
         onDispose {
             try {
                 locationManager.removeUpdates(listener)
@@ -551,18 +601,36 @@ fun MainScreen(
         }
     }
 
-    LaunchedEffect(Unit) {
+    var modelLoadRetryTick by remember { mutableIntStateOf(0) }
+    var modelLoadError by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(modelLoadRetryTick) {
+        modelLoadError = null
         statusText = "Loading 3D AI Model..."
         try {
             val loadedInterpreter = withContext(Dispatchers.IO) {
-                MogeInterpreter(context)
+                MogeInterpreter(context) { progressMsg ->
+                    Handler(Looper.getMainLooper()).post {
+                        statusText = progressMsg
+                    }
+                }
             }
-            interpreter = loadedInterpreter
-            activeAccelerator = loadedInterpreter.activeAccelerator
-            statusText = "Ready"
+            if (loadedInterpreter.isReady) {
+                interpreter?.close()
+                interpreter = loadedInterpreter
+                activeAccelerator = loadedInterpreter.activeAccelerator
+                modelLoadError = null
+                statusText = if (cameraInstance != null) "Scanning" else "Ready"
+            } else {
+                val err = loadedInterpreter.loadError ?: "Model unavailable"
+                loadedInterpreter.close()
+                modelLoadError = err
+                statusText = "Model error (tap to retry): $err"
+            }
         } catch (e: Exception) {
             Log.e("MainScreen", "Failed to load MogeInterpreter", e)
-            statusText = "Failed to load model: ${e.message}"
+            modelLoadError = e.message ?: "Unknown error"
+            statusText = "Model error (tap to retry): ${e.message}"
         }
     }
 
@@ -658,7 +726,12 @@ fun MainScreen(
                 text = "3D POINT CLOUD • $statusText ($activeAccelerator)",
                 fontFamily = FontFamily.Monospace,
                 fontSize = 9.sp,
-                color = Color(0xFF535358)
+                color = if (modelLoadError != null) Color(0xFFD32F2F) else Color(0xFF535358),
+                modifier = if (modelLoadError != null) {
+                    Modifier.clickable { modelLoadRetryTick++ }
+                } else {
+                    Modifier
+                }
             )
             // Row 1: Reset View, Multi Mode, and visloc-rs VI-SLAM HUD toggle
             Row(
@@ -1103,231 +1176,281 @@ fun MainScreen(
                         .border(2.dp, Color.White, RoundedCornerShape(14.dp))
                 }
             ) {
-                AndroidView(
-                    factory = { ctx ->
-                        val previewView = PreviewView(ctx).apply {
-                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
+
+                LaunchedEffect(hasCameraPermission, previewViewRef) {
+                    val pv = previewViewRef ?: return@LaunchedEffect
+                    if (!hasCameraPermission) return@LaunchedEffect
+
+                    val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+                    cameraProviderFuture.addListener({
+                        val cameraProvider = cameraProviderFuture.get()
+
+                        val preview = Preview.Builder().build().also {
+                            it.setSurfaceProvider(pv.surfaceProvider)
                         }
-                        
-                        val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-                        cameraProviderFuture.addListener({
-                            val cameraProvider = cameraProviderFuture.get()
-                            
-                            val preview = Preview.Builder().build().also {
-                                it.setSurfaceProvider(previewView.surfaceProvider)
-                            }
-                            
-                            val imageAnalyzer = ImageAnalysis.Builder()
-                                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                                .build()
-                                .also { analyzer ->
-                                    analyzer.setAnalyzer(cameraExecutor) { imageProxy ->
-                                        try {
-                                            if (isContinuousScanning || shouldTakeSnapshot.compareAndSet(true, false)) {
-                                                 val width = imageProxy.width
-                                                 val height = imageProxy.height
-                                                 val plane = imageProxy.planes[0]
-                                                 val buffer = plane.buffer
-                                                 
-                                                 val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                                                 bitmap.copyPixelsFromBuffer(buffer)
-                                                 
-                                                 val rotation = imageProxy.imageInfo.rotationDegrees
-                                                 val rotatedBitmap = if (rotation != 0) {
-                                                     val matrix = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
-                                                     Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, true)
-                                                 } else {
-                                                     bitmap
-                                                 }
 
-                                                 // Save feeds when snapshot is captured
-                                                 val ts = System.currentTimeMillis()
-                                                 saveSnapshotBitmap(context, rotatedBitmap, "moge_rgb_$ts.png")
-                                                 val capturedThermalBmp = if (isThermalEnabled) (lastThermalBitmap ?: thermalManager.captureFrame()) else null
-                                                 if (capturedThermalBmp != null) {
-                                                     saveSnapshotBitmap(context, capturedThermalBmp, "moge_thermal_$ts.png")
-                                                     val thermalRaw = thermalManager.captureRaw()
-                                                     if (thermalRaw != null) {
-                                                         saveSnapshotRaw(context, thermalRaw, "moge_thermal_$ts.raw")
-                                                     }
-                                                     // 1. Thermal over 2D frame (perspective homography registered)
-                                                     val fused2D = ThermalCalibrationManager.createFusedColorBitmap(
-                                                         rgbBitmap = rotatedBitmap,
-                                                         thermalBitmap = capturedThermalBmp,
-                                                         calibration = activeCalibrationRef.get(),
-                                                         alpha = 1.0f
-                                                     )
-                                                     saveSnapshotBitmap(context, fused2D, "moge_fused_$ts.png")
-                                                 }
+                        val imageAnalyzer = ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                            .build()
+                            .also { analyzer ->
+                                analyzer.setAnalyzer(cameraExecutor) { imageProxy ->
+                                    try {
+                                        if (isContinuousScanning || shouldTakeSnapshot.compareAndSet(true, false)) {
+                                            val width = imageProxy.width
+                                            val height = imageProxy.height
+                                            val plane = imageProxy.planes[0]
+                                            val buffer = plane.buffer
+                                            buffer.rewind()
+                                            val pixelStride = plane.pixelStride
+                                            val rowStride = plane.rowStride
 
-                                                 val R_i = synchronized(captureRotationMatrix) { captureRotationMatrix.clone() }
-                                                 val R_0 = synchronized(firstFrameRotationMatrix) { firstFrameRotationMatrix.clone() }
-                                                 val R_0_T = transpose3x3(R_0)
-                                                 val R_rel = multiply3x3(R_0_T, R_i)
-
-                                                 if (isRecordDatasetModeActive.get()) {
-                                                     val dir = currentDatasetDirRef.get()
-                                                     if (dir != null) {
-                                                         val frameIndex = datasetFrameCountRef.getAndIncrement()
-                                                         val thermalBmp = if (isThermalEnabled) (lastThermalBitmap ?: thermalManager.captureFrame()) else null
-                                                         val thermalRaw = if (isThermalEnabled) thermalManager.captureRaw() else null
-                                                         saveDatasetFrame(context, dir, frameIndex, rotatedBitmap, thermalBmp, thermalRaw, FloatArray(0), R_rel)
-                                                         writeStateFile(dir, frameIndex + 1, 518, 518)
-                                                     }
-                                                     Handler(Looper.getMainLooper()).post {
-                                                         isProcessingFrame = false
-                                                     }
-                                                 } else {
-                                                     val model = interpreter
-                                                     if (model != null) {
-                                                         Log.d("Analyzer", "Running inference: setting isProcessingFrame = true")
-                                                         Handler(Looper.getMainLooper()).post {
-                                                            isProcessingFrame = true
-                                                         }
-                                                         val thermalBmp = capturedThermalBmp ?: if (isThermalEnabled) lastThermalBitmap else null
-                                                         val fusedColorBitmap = if (thermalBmp != null) {
-                                                             ThermalCalibrationManager.createFusedColorBitmap(
-                                                                 rgbBitmap = rotatedBitmap,
-                                                                 thermalBitmap = thermalBmp,
-                                                                 calibration = activeCalibrationRef.get(),
-                                                                 alpha = 1.0f
-                                                             )
-                                                         } else {
-                                                             rotatedBitmap
-                                                         }
-                                                         val pureThermalColorBitmap = if (thermalBmp != null) {
-                                                             ThermalCalibrationManager.createPureThermalColorBitmap(
-                                                                 width = rotatedBitmap.width,
-                                                                 height = rotatedBitmap.height,
-                                                                 thermalBitmap = thermalBmp,
-                                                                 calibration = activeCalibrationRef.get()
-                                                             )
-                                                         } else {
-                                                             rotatedBitmap
-                                                         }
-                                                         val result = model.runInferenceWithColor(rotatedBitmap, fusedColorBitmap, stride = 4)
-                                                         if (result != null) {
-                                                             val positions = result.first
-                                                             val fusedColors = result.second
-                                                             val rgbColors = model.sampleColors(rotatedBitmap, stride = 4)
-                                                             val thermalColors = model.sampleColors(pureThermalColorBitmap, stride = 4)
-
-                                                             val numPoints = positions.size / 3
-                                                             val glPositions = FloatArray(positions.size)
-                                                             for (j in 0 until numPoints) {
-                                                                 glPositions[j * 3]     =  positions[j * 3]
-                                                                 glPositions[j * 3 + 1] = -positions[j * 3 + 1]
-                                                                 glPositions[j * 3 + 2] = -positions[j * 3 + 2]
-                                                             }
-
-                                                             // Execute visloc-rs Forster IMU Pre-Integration + KLT + VIBA2 6-DoF Pose Fusion
-                                                             val kfState = vislocEngine.processKeyframeCapture(
-                                                                 rgbBitmap = rotatedBitmap,
-                                                                 rawPositions = positions,
-                                                                 rRelWorld = R_rel
-                                                             )
-
-                                                             if (isMultiModeSnapshot.get() || isContinuousScanning) {
-                                                                 val s = kfState.scaleFactor
-                                                                 val tx = kfState.pWb[0]
-                                                                 val ty = kfState.pWb[1]
-                                                                 val tz = kfState.pWb[2]
-                                                                 for (j in 0 until numPoints) {
-                                                                     rotatePoint3x3(glPositions, j * 3, R_rel)
-                                                                     glPositions[j * 3]     = glPositions[j * 3] * s + tx
-                                                                     glPositions[j * 3 + 1] = glPositions[j * 3 + 1] * s + ty
-                                                                     glPositions[j * 3 + 2] = glPositions[j * 3 + 2] * s + tz
-                                                                 }
-                                                             }
-
-                                                             val (prunedThermalPos, prunedThermalCol) = ThermalCalibrationManager.filterPointsInsideQuad(
-                                                                 positions = glPositions,
-                                                                 colors = thermalColors,
-                                                                 stride = 4,
-                                                                 isMoge3 = model.isMoge3,
-                                                                 calibration = activeCalibrationRef.get()
-                                                             )
-
-                                                             val triple = TripleReconstructionResult(
-                                                                 fused = Pair(glPositions.clone(), fusedColors.clone()),
-                                                                 rgb = Pair(glPositions.clone(), rgbColors.clone()),
-                                                                 thermal = Pair(prunedThermalPos, prunedThermalCol)
-                                                             )
-
-                                                             // Export triple 3D GLBs (Fused, Pure Thermal, Pure RGB) to Downloads
-                                                             if (!isContinuousScanning) {
-                                                                 val lat = currentLatitude
-                                                                 val lon = currentLongitude
-                                                                 val glbFused = exportGlb(glPositions, fusedColors, lat, lon)
-                                                                 val glbThermal = exportGlb(prunedThermalPos, prunedThermalCol, lat, lon)
-                                                                 val glbRgb = exportGlb(glPositions, rgbColors, lat, lon)
-
-                                                                 saveSnapshotGlb(context, glbFused, "moge_scan_${ts}_fused.glb")
-                                                                 saveSnapshotGlb(context, glbThermal, "moge_scan_${ts}_thermal.glb")
-                                                                 saveSnapshotGlb(context, glbRgb, "moge_scan_${ts}_rgb.glb")
-                                                                 saveSnapshotText(context, vislocEngine.viBundleAdjuster.exportTumTrajectory(), "visloc_trajectory_${ts}.tum")
-                                                             }
-
-                                                             val accumulate = isContinuousScanning || isMultiModeSnapshot.get()
-                                                             accumulator.addFrame(glPositions, fusedColors, accumulate)
-                                                             val (mergedPositions, mergedColors) = accumulator.getPositionsAndColors()
-                                                             Handler(Looper.getMainLooper()).post {
-                                                                 lastTripleResult = triple
-                                                                 lastPositions = mergedPositions
-                                                                 lastColors = mergedColors
-                                                                 renderer.updatePoints(mergedPositions, mergedColors)
-                                                             }
-                                                         }
-                                                         Log.d("Analyzer", "Finished inference: setting isProcessingFrame = false")
-                                                         Handler(Looper.getMainLooper()).post {
-                                                             isProcessingFrame = false
-                                                         }
-                                                     } else {
-                                                         Log.d("Analyzer", "Model null: setting isProcessingFrame = false")
-                                                         Handler(Looper.getMainLooper()).post {
-                                                             isProcessingFrame = false
-                                                         }
-                                                     }
-                                                 }
+                                            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                                            if (rowStride == width * pixelStride) {
+                                                bitmap.copyPixelsFromBuffer(buffer)
                                             } else {
+                                                val packed = ByteBuffer.allocate(width * height * 4)
+                                                val rowBytes = ByteArray(width * 4)
+                                                for (row in 0 until height) {
+                                                    buffer.position(row * rowStride)
+                                                    buffer.get(rowBytes, 0, width * 4)
+                                                    packed.put(rowBytes)
+                                                }
+                                                packed.rewind()
+                                                bitmap.copyPixelsFromBuffer(packed)
+                                            }
+
+                                            val rotation = imageProxy.imageInfo.rotationDegrees
+                                            val rotatedBitmap = if (rotation != 0) {
+                                                val matrix = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
+                                                Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, true)
+                                            } else {
+                                                bitmap
+                                            }
+
+                                            // Save feeds when snapshot is captured
+                                            val ts = System.currentTimeMillis()
+                                            saveSnapshotBitmap(context, rotatedBitmap, "moge_rgb_$ts.png")
+                                            val capturedThermalBmp = if (isThermalEnabled) (lastThermalBitmap ?: thermalManager.captureFrame()) else null
+                                            if (capturedThermalBmp != null) {
+                                                saveSnapshotBitmap(context, capturedThermalBmp, "moge_thermal_$ts.png")
+                                                val thermalRaw = thermalManager.captureRaw()
+                                                if (thermalRaw != null) {
+                                                    saveSnapshotRaw(context, thermalRaw, "moge_thermal_$ts.raw")
+                                                }
+                                                // 1. Thermal over 2D frame (perspective homography registered)
+                                                val fused2D = ThermalCalibrationManager.createFusedColorBitmap(
+                                                    rgbBitmap = rotatedBitmap,
+                                                    thermalBitmap = capturedThermalBmp,
+                                                    calibration = activeCalibrationRef.get(),
+                                                    alpha = 1.0f
+                                                )
+                                                saveSnapshotBitmap(context, fused2D, "moge_fused_$ts.png")
+                                            }
+
+                                            val R_i = synchronized(captureRotationMatrix) { captureRotationMatrix.clone() }
+                                            val R_0 = synchronized(firstFrameRotationMatrix) { firstFrameRotationMatrix.clone() }
+                                            val R_0_T = transpose3x3(R_0)
+                                            val R_rel = multiply3x3(R_0_T, R_i)
+
+                                            if (isRecordDatasetModeActive.get()) {
+                                                val dir = currentDatasetDirRef.get()
+                                                if (dir != null) {
+                                                    val frameIndex = datasetFrameCountRef.getAndIncrement()
+                                                    val thermalBmp = if (isThermalEnabled) (lastThermalBitmap ?: thermalManager.captureFrame()) else null
+                                                    val thermalRaw = if (isThermalEnabled) thermalManager.captureRaw() else null
+                                                    saveDatasetFrame(context, dir, frameIndex, rotatedBitmap, thermalBmp, thermalRaw, FloatArray(0), R_rel)
+                                                    writeStateFile(dir, frameIndex + 1, 518, 518)
+                                                }
                                                 Handler(Looper.getMainLooper()).post {
                                                     isProcessingFrame = false
                                                 }
+                                            } else {
+                                                val model = currentInterpreter
+                                                if (model != null && model.isReady) {
+                                                    Log.d("Analyzer", "Running inference: setting isProcessingFrame = true")
+                                                    Handler(Looper.getMainLooper()).post {
+                                                        isProcessingFrame = true
+                                                    }
+                                                    val thermalBmp = capturedThermalBmp ?: if (isThermalEnabled) lastThermalBitmap else null
+                                                    val fusedColorBitmap = if (thermalBmp != null) {
+                                                        ThermalCalibrationManager.createFusedColorBitmap(
+                                                            rgbBitmap = rotatedBitmap,
+                                                            thermalBitmap = thermalBmp,
+                                                            calibration = activeCalibrationRef.get(),
+                                                            alpha = 1.0f
+                                                        )
+                                                    } else {
+                                                        rotatedBitmap
+                                                    }
+                                                    val pureThermalColorBitmap = if (thermalBmp != null) {
+                                                        ThermalCalibrationManager.createPureThermalColorBitmap(
+                                                            width = rotatedBitmap.width,
+                                                            height = rotatedBitmap.height,
+                                                            thermalBitmap = thermalBmp,
+                                                            calibration = activeCalibrationRef.get()
+                                                        )
+                                                    } else {
+                                                        rotatedBitmap
+                                                    }
+                                                    val result = model.runInferenceWithColor(rotatedBitmap, fusedColorBitmap, stride = 4)
+                                                    if (result != null) {
+                                                        val positions = result.first
+                                                        val fusedColors = result.second
+                                                        val rgbColors = model.sampleColors(rotatedBitmap, stride = 4)
+                                                        val thermalColors = model.sampleColors(pureThermalColorBitmap, stride = 4)
+
+                                                        val numPoints = positions.size / 3
+                                                        val glPositions = FloatArray(positions.size)
+                                                        for (j in 0 until numPoints) {
+                                                            glPositions[j * 3]     =  positions[j * 3]
+                                                            glPositions[j * 3 + 1] = -positions[j * 3 + 1]
+                                                            glPositions[j * 3 + 2] = -positions[j * 3 + 2]
+                                                        }
+
+                                                        // Execute visloc-rs Forster IMU Pre-Integration + KLT + VIBA2 6-DoF Pose Fusion
+                                                        val kfState = vislocEngine.processKeyframeCapture(
+                                                            rgbBitmap = rotatedBitmap,
+                                                            rawPositions = positions,
+                                                            rRelWorld = R_rel
+                                                        )
+
+                                                        if (isMultiModeSnapshot.get() || isContinuousScanning) {
+                                                            val s = kfState.scaleFactor
+                                                            val tx = kfState.pWb[0]
+                                                            val ty = kfState.pWb[1]
+                                                            val tz = kfState.pWb[2]
+                                                            for (j in 0 until numPoints) {
+                                                                rotatePoint3x3(glPositions, j * 3, R_rel)
+                                                                glPositions[j * 3]     = glPositions[j * 3] * s + tx
+                                                                glPositions[j * 3 + 1] = glPositions[j * 3 + 1] * s + ty
+                                                                glPositions[j * 3 + 2] = glPositions[j * 3 + 2] * s + tz
+                                                            }
+                                                        }
+
+                                                        val (prunedThermalPos, prunedThermalCol) = ThermalCalibrationManager.filterPointsInsideQuad(
+                                                            positions = glPositions,
+                                                            colors = thermalColors,
+                                                            stride = 4,
+                                                            isMoge3 = model.isMoge3,
+                                                            calibration = activeCalibrationRef.get()
+                                                        )
+
+                                                        val triple = TripleReconstructionResult(
+                                                            fused = Pair(glPositions.clone(), fusedColors.clone()),
+                                                            rgb = Pair(glPositions.clone(), rgbColors.clone()),
+                                                            thermal = Pair(prunedThermalPos, prunedThermalCol)
+                                                        )
+
+                                                        // Export triple 3D GLBs (Fused, Pure Thermal, Pure RGB) to Downloads
+                                                        if (!isContinuousScanning) {
+                                                            val lat = currentLatitude
+                                                            val lon = currentLongitude
+                                                            val glbFused = exportGlb(glPositions, fusedColors, lat, lon)
+                                                            val glbThermal = exportGlb(prunedThermalPos, prunedThermalCol, lat, lon)
+                                                            val glbRgb = exportGlb(glPositions, rgbColors, lat, lon)
+
+                                                            saveSnapshotGlb(context, glbFused, "moge_scan_${ts}_fused.glb")
+                                                            saveSnapshotGlb(context, glbThermal, "moge_scan_${ts}_thermal.glb")
+                                                            saveSnapshotGlb(context, glbRgb, "moge_scan_${ts}_rgb.glb")
+                                                            saveSnapshotText(context, vislocEngine.viBundleAdjuster.exportTumTrajectory(), "visloc_trajectory_${ts}.tum")
+                                                        }
+
+                                                        val accumulate = isContinuousScanning || isMultiModeSnapshot.get()
+                                                        accumulator.addFrame(glPositions, fusedColors, accumulate)
+                                                        val (mergedPositions, mergedColors) = accumulator.getPositionsAndColors()
+                                                        Handler(Looper.getMainLooper()).post {
+                                                            lastTripleResult = triple
+                                                            lastPositions = mergedPositions
+                                                            lastColors = mergedColors
+                                                            renderer.updatePoints(mergedPositions, mergedColors)
+                                                        }
+                                                    }
+                                                    Log.d("Analyzer", "Finished inference: setting isProcessingFrame = false")
+                                                    Handler(Looper.getMainLooper()).post {
+                                                        isProcessingFrame = false
+                                                    }
+                                                } else {
+                                                    Log.d("Analyzer", "Model not ready: setting isProcessingFrame = false")
+                                                    Handler(Looper.getMainLooper()).post {
+                                                        isProcessingFrame = false
+                                                    }
+                                                }
                                             }
-                                        } catch (e: Exception) {
-                                            Log.e("Analyzer", "Frame analysis failed", e)
+                                        } else {
                                             Handler(Looper.getMainLooper()).post {
                                                 isProcessingFrame = false
                                             }
-                                        } finally {
-                                            imageProxy.close()
                                         }
+                                    } catch (e: Exception) {
+                                        Log.e("Analyzer", "Frame analysis failed", e)
+                                        Handler(Looper.getMainLooper()).post {
+                                            isProcessingFrame = false
+                                        }
+                                    } finally {
+                                        imageProxy.close()
                                     }
                                 }
-
-                            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-                            try {
-                                cameraProvider.unbindAll()
-                                val camera = cameraProvider.bindToLifecycle(
-                                    lifecycleOwner,
-                                    cameraSelector,
-                                    preview,
-                                    imageAnalyzer
-                                )
-                                cameraInstance = camera
-                                camera.cameraControl.enableTorch(isFlashlightOn)
-                                statusText = "Scanning"
-                            } catch (exc: Exception) {
-                                Log.e("CameraX", "Use case binding failed", exc)
-                                statusText = "Camera error"
                             }
-                        }, ContextCompat.getMainExecutor(ctx))
-                        
-                        previewView
+
+                        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                        try {
+                            cameraProvider.unbindAll()
+                            val camera = cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                cameraSelector,
+                                preview,
+                                imageAnalyzer
+                            )
+                            cameraInstance = camera
+                            camera.cameraControl.enableTorch(isFlashlightOn)
+                            if (currentInterpreter?.isReady == true) {
+                                statusText = "Scanning"
+                            }
+                        } catch (exc: Exception) {
+                            Log.e("CameraX", "Use case binding failed", exc)
+                            statusText = "Camera error"
+                        }
+                    }, ContextCompat.getMainExecutor(context))
+                }
+
+                AndroidView(
+                    factory = { ctx ->
+                        PreviewView(ctx).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            previewViewRef = this
+                        }
                     },
                     modifier = Modifier.fillMaxSize()
                 )
+
+                if (!hasCameraPermission) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.85f))
+                            .clickable {
+                                permissionLauncher.launch(
+                                    arrayOf(
+                                        Manifest.permission.CAMERA,
+                                        Manifest.permission.ACCESS_FINE_LOCATION,
+                                        Manifest.permission.ACCESS_COARSE_LOCATION
+                                    )
+                                )
+                            }
+                            .padding(8.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "Tap to allow\nCamera",
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color.White,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
 
                 if (isCalibrationMode) {
                     ThermalCalibrationInteractiveOverlay(
@@ -1541,6 +1664,26 @@ fun MainScreen(
                         }
                     )
                     .clickable(enabled = !isProcessingFrame) {
+                        if (!hasCameraPermission) {
+                            permissionLauncher.launch(
+                                arrayOf(
+                                    Manifest.permission.CAMERA,
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                                )
+                            )
+                            return@clickable
+                        }
+                        if (!isRecordDatasetMode && interpreter?.isReady != true) {
+                            if (modelLoadError != null) {
+                                modelLoadRetryTick++
+                                Toast.makeText(context, "Retrying 3D AI model download...", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "3D AI Model is still loading — check progress at top-left", Toast.LENGTH_SHORT).show()
+                            }
+                            return@clickable
+                        }
+
                         val positions = lastPositions
                         val colors = lastColors
                         val isMulti = isMultiMode

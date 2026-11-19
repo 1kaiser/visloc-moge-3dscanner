@@ -182,8 +182,8 @@ fun DatasetProcessorDialog(
                     Button(
                         onClick = {
                             val target = selectedDataset ?: return@Button
-                            val interp = interpreter ?: run {
-                                Toast.makeText(context, "Model not loaded yet", Toast.LENGTH_SHORT).show()
+                            val interp = interpreter?.takeIf { it.isReady } ?: run {
+                                Toast.makeText(context, "3D AI Model is still loading — please wait", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
                             isProcessing = true

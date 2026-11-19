@@ -1,0 +1,6 @@
+{
+  "name": "VisLoc MoGe 3D Scanner",
+  "description": "Visual-inertial 6-DoF metric 3D point cloud and USB-C thermal scanner powered by on-device MoGe LiteRT, Forster IMU pre-integration, and Google Filament.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
